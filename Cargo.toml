@@ -1,5 +1,5 @@
 [package]
-name = "roguelike"
+name = "tcod-rs_roguelike_demo"
 version = "0.1.0"
 authors = ["krotera <01101011@tuta.io>"]
 edition = "2018"

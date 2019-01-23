@@ -54,6 +54,9 @@ const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic;
 const FOV_LIGHT_WALLS: bool = true;
 const TORCH_RADIUS: i32 = 10;
 
+// XP and levels
+const LEVEL_XP_RANGE: [i32; 10] = [60, 138, 290, 550, 940, 1498, 2247, 3145, 4403, 5724];
+
 const HEAL_AMOUNT: i32 = 4;
 const ENE_AGGR_RANGE: i32 = 5;
 const ENE_AGGR_DAMAGE: i32 = 20;
@@ -73,6 +76,8 @@ const MSG_X: i32 = BAR_WIDTH + 2;
 const MSG_WIDTH: i32 = SCREEN_WIDTH - BAR_WIDTH - 2;
 const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
 const INVENTORY_WIDTH: i32 = 50;
+const LEVEL_SCREEN_WIDTH: i32 = 40;
+const STATS_SCREEN_WIDTH: i32 = 30;
 
 type Map = Vec<Vec<Tile>>; // 2D map of tiles
 type Messages = Vec<(String, Color)>;
@@ -88,14 +93,6 @@ struct Tcod {
     panel: Offscreen,
     fov: FovMap,
     mouse: Mouse,
-}
-
-// Vital organs
-#[derive(Serialize, Deserialize)] // https://docs.serde.rs/serde/trait.Serialize.html
-struct Game {
-    map: Map,
-    log: Messages,
-    inv: Vec<Object>,
 }
 
 /// A map tile
@@ -150,6 +147,7 @@ struct Object {
     color: Color,
     name: String,
     blocks: bool,
+    always_visible: bool,
     alive: bool,
     // Components
     fighter: Option<Fighter>,
@@ -165,6 +163,7 @@ impl Object {
             color: color,
             name: name.into(),
             blocks: blocks,
+            always_visible: false,
             alive: false,
             // Components
             fighter: None,
@@ -203,18 +202,24 @@ impl Object {
         ((dx.pow(2) + dy.pow(2)) as f32).sqrt() // Euclidean
     }
 
-    pub fn take_damage(&mut self, damage: i32, game: &mut Game) {
+    /// Applies damage if this object has Fighter and returns kill XP in an option
+    /// on this object's death
+    pub fn take_damage(&mut self, damage: i32, game: &mut Game) -> Option<i32> {
         // Apply damage if possible
-        if let Some(fighter) = self.fighter.as_mut() { // Mutable borrow!
+        if let Some(fighter) = self.fighter.as_mut() { // Mutable borrow of &mut self!
             if damage > 0 {
                 fighter.hp -= damage;
             }
-            // Check for death and call death function
+        }
+        // Check for death to call death function and return kill XP
+        if let Some(fighter) = self.fighter { // This would be a second mutable borrow, so new block.
             if fighter.hp <= 0 {
                 self.alive = false;
                 fighter.on_death.callback(self, game);
+                return Some(fighter.xp);
             }
         }
+        None
     }
 
     pub fn attack(&mut self, target: &mut Object, game: &mut Game) {
@@ -223,12 +228,20 @@ impl Object {
         if damage > 0 {
             game.log.add(format!("{} attacks {} for {} HP.", self.name, target.name, damage),
                          colors::WHITE);
-            target.take_damage(damage, game);
+            if let Some(xp) = target.take_damage(damage, game) {
+                // Award XP to slayer
+                self.fighter.as_mut().unwrap().xp += xp; // Unwrap self's Fighter option
+                // If self lacks Fighter, this will induce a crash, but that should be okay
+                // since non-Fighter entities shouldn't be doing damage and killing things.
+            }
         } else {
             game.log.add(format!("{} attacks {} but it has no effect.", self.name, target.name),
                     colors::WHITE);
         }
     }
+
+    // TODO: Add use_item here, with a signature that also takes this object's ID for XP awards
+    // when it gets kills with items, abilities, etc.
 
     // Heal up to max_hp by given amount
     pub fn heal(&mut self, amount: i32) {
@@ -246,6 +259,16 @@ impl Object {
     }
 }
 
+// The game and its vital organs
+// (Except for objects, which is tentatively kept separate to avoid borrow checker issues)
+#[derive(Serialize, Deserialize)] // https://docs.serde.rs/serde/trait.Serialize.html
+struct Game {
+    map: Map,
+    log: Messages,
+    inv: Vec<Object>,
+    dungeon_level: u32,
+}
+
 // We'll use composition (in the form of components) rather than inheritance to determine
 // object behavior. Component structs containing a behavior or functionality will be added to
 // objects that should have that behavior.
@@ -257,13 +280,17 @@ impl Object {
 //
 // See more: https://en.wikipedia.org/wiki/Entity%E2%80%93component%E2%80%93system
 
-// Able to attack or be attacked
+// Able to attack or be attacked, die meaningfully, and earn XP
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Fighter {
     max_hp: i32,
     hp: i32,
     defense: i32,
     power: i32,
+
+    xp: i32,
+    level: i32,
+
     on_death: DeathCallback, // Death behavior
 }
 
@@ -287,7 +314,7 @@ enum Item {
     Heal,
     Aggregate,
     Confuse,
-    Negative_energy_grenade,
+    NegativeEnergyGrenade,
 }
 
 // On death, monsters drop loot and leave corpses, the player loses the game, etc.
@@ -647,13 +674,11 @@ fn ai_confused(monster_id: usize,
                previous_ai: Box<Ai>,
                num_turns: i32) -> Ai {
     if num_turns >= 0 { // Still confused...
-        move_by(
-            monster_id,
-            rand::thread_rng().gen_range(-1, 2), // Weird numbers due to Euclidean distances...
-            rand::thread_rng().gen_range(-1, 2),
-            objects,
-            game
-        );
+        move_by(monster_id,
+                rand::thread_rng().gen_range(-1, 2), // Weird numbers due to Euclidean distances...
+                rand::thread_rng().gen_range(-1, 2),
+                objects,
+                game);
         // ...but one turn closer to sanity.
         Ai::Confused{previous_ai: previous_ai, num_turns: num_turns - 1}
     } else { // No longer confused!
@@ -673,13 +698,53 @@ fn player_death(player: &mut Object, game: &mut Game) {
 
 fn monster_death(monster: &mut Object, game: &mut Game) {
     // Turn monster into corpse
-    game.log.add(format!("{} dies.", monster.name), colors::ORANGE);
+    game.log.add(format!("{} dies.\nYou gain {} XP.",
+                         monster.name,
+                         monster.fighter.unwrap().xp),
+                         colors::ORANGE);
     monster.char = '%';
     monster.color = colors::DARK_RED;
     monster.blocks = false;
     monster.fighter = None;
     monster.ai = None;
     monster.name = format!("{} corpse", monster.name);
+}
+
+// Level up the player
+fn level_up(tcod: &mut Tcod, objects: &mut [Object], game: &mut Game) {
+    let pf = objects[PLAYER].fighter.as_mut().unwrap();
+    // Rust noob note: Must use as_mut(), otherwise, a new Fighter is copied into this scope.
+    // We do that frequently throughout this code when we're only reading from Fighters.
+    // With foo: Option<T>, foo.as_mut() = Option<&mut T>, which .unwrap()s to a &mut T.
+
+    if pf.xp >= LEVEL_XP_RANGE[pf.level as usize] {
+        pf.level += 1; // Ding!
+        game.log.add(format!("You've reached level {}!", 0), colors::YELLOW);
+        // Increase stats
+        let mut choice = None;
+
+        while choice.is_none() { // Keep asking until a choice is made
+            choice = menu("Choose a stat to raise:\n",
+                          &[format!("+20 HP (to {} HP)", pf.max_hp),
+                            format!("+1 power (to {})", pf.power),
+                            format!("+1 defense (to {})", pf.defense)],
+                          LEVEL_SCREEN_WIDTH,
+                          &mut tcod.root);
+        };
+        match choice.unwrap() {
+            0 => {
+                pf.max_hp += 20;
+                pf.hp += 20;
+            }
+            1 => {
+                pf.power += 1;
+            }
+            2 => {
+                pf.defense += 1;
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn pick_item_up(object_id: usize, objects: &mut Vec<Object>, game: &mut Game) {
@@ -714,16 +779,17 @@ fn use_item(tcod: &mut Tcod,
     if let Some(item) = game.inv[inventory_id].item {
         // Get item's effect function
         // Note: because the different match arms return different functions, Rust treats them as
-        // returning different types, which it doesn't allow. To fix, we have to annotate on_use()
-        // to specify that all the different functions satisfy it.
-        // For the same reason, all the functions have the same signatures, including params
-        // most may not need but that some do. These are prefixed with a '_' to disable unused
-        // warnings: https://stackoverflow.com/questions/48361537/why-do-underscore-prefixed-variables-exist
+        // returning different types, which it doesn't allow.
+        // To fix, we have to annotate on_use() to specify that all the different functions
+        // satisfy a uniform signature.
+        // This means some of the functions have params they may not need.
+        // These are prefixed with a '_' to disable unused warnings:
+        // https://stackoverflow.com/questions/48361537/why-do-underscore-prefixed-variables-exist
         let on_use: fn(&mut Tcod, usize, &mut [Object], &mut Game) -> UseResult = match item {
             Item::Heal => cast_heal,
             Item::Aggregate => cast_ene_aggr,
             Item::Confuse => cast_confuse,
-            Item::Negative_energy_grenade => cast_neg_ene_gren,
+            Item::NegativeEnergyGrenade => cast_neg_ene_gren,
         };
 
         // If we have an item, match its effect type
@@ -772,7 +838,10 @@ fn cast_ene_aggr(tcod: &mut Tcod,
         game.log.add(format!("{} takes {} damage from being aggregated!",
                              objects[monster_id].name, ENE_AGGR_DAMAGE),
                      colors::LIGHT_BLUE);
-        objects[monster_id].take_damage(ENE_AGGR_DAMAGE, game);
+        if let Some(xp) = objects[monster_id].take_damage(ENE_AGGR_DAMAGE, game) {
+            // We're assuming the player used this, so award them XP for any kills.
+            objects[PLAYER].fighter.as_mut().unwrap().xp += xp;
+        }
         UseResult::UsedUp
     } else {
         game.log.add("No viable target is close enough.", colors::RED);
@@ -818,15 +887,25 @@ fn cast_neg_ene_gren(tcod: &mut Tcod,
         Some(tile_pos) => tile_pos,
         None => return UseResult::Cancelled,
     };
-    game.log.add(format!("Nearby fields scramble in a burst of yin and its yang echo!"),
+    game.log.add(format!("A burst of yin followed by its yang echo violently rearrange nearby fields!"),
             colors::ORANGE);
-    for obj in objects { // Damage objects in grenade's AoE
+    let mut xp_accumulated = 0; // Can't award player on the fly INSIDE the for loop since our
+                                // objects reference is either moved in the loop header
+                                //      for obj in objects {...
+                                // or borrowed mutably in the loop header
+                                //      for obj in objects.iter_mut() {...
+                                // and then borrowed by the xp addition.
+                                // So we need to add all the XP outside of the loop.
+    for obj in objects.iter_mut() { // Damage objects in grenade's AoE
         if obj.distance(x, y) <= NEG_ENE_GREN_RADIUS as f32 && obj.fighter.is_some() {
             game.log.add(format!("{} takes {} damage.", obj.name, NEG_ENE_GREN_DAMAGE),
                          colors::WHITE);
-            obj.take_damage(NEG_ENE_GREN_DAMAGE, game);
+            if let Some(xp) = obj.take_damage(NEG_ENE_GREN_DAMAGE, game) {
+                xp_accumulated +=  xp;
+            }
         }
     }
+    objects[PLAYER].fighter.as_mut().unwrap().xp += xp_accumulated;
     UseResult::UsedUp
 }
 
@@ -834,6 +913,7 @@ fn cast_neg_ene_gren(tcod: &mut Tcod,
 Core functions
 *******************************************************************************/
 
+/// Returns if a tile is blocked for movement (occupied by a blocking object)
 fn is_blocked(x: i32, y: i32, objects: &[Object], map: &Map) -> bool {
     // First test map tile
     if map[x as usize][y as usize].blocked {
@@ -845,7 +925,7 @@ fn is_blocked(x: i32, y: i32, objects: &[Object], map: &Map) -> bool {
     })
 }
 
-// Clears an area of the map to create a room
+/// Clears an area of the map to create a room
 fn create_room(room: Rect, map: &mut Map) {
     for x in (room.x1 + 1)..room.x2 {
         for y in (room.y1 + 1)..room.y2 {
@@ -860,13 +940,13 @@ fn create_h_tunnel(x1: i32, x2: i32, y: i32, map: &mut Map) {
         map[x as usize][y as usize] = Tile::new_empty();
     }
 }
-
 fn create_v_tunnel(y1: i32, y2: i32, x: i32, map: &mut Map) {
     for y in cmp::min(y1, y2)..(cmp::max(y1, y2) + 1) {
         map[x as usize][y as usize] = Tile::new_empty();
     }
 }
 
+/// Populates a room with objects
 fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
     // Spawn random number of monsters per room
     let num_monsters = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
@@ -883,6 +963,8 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
                     hp: 10,
                     defense: 0,
                     power: 3,
+                    xp: 5,
+                    level: 0,
                     on_death: DeathCallback::Monster,
                 });
                 soliton.ai = Some(Ai::Basic);
@@ -894,6 +976,8 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
                     hp: 16,
                     defense: 1,
                     power: 4,
+                    xp: 10,
+                    level: 0,
                     on_death: DeathCallback::Monster,
                 });
                 bion.ai = Some(Ai::Basic);
@@ -913,7 +997,7 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
 
         if !is_blocked(x, y, objects, map) {
             let dice = rand::random::<f32>(); // [0.0, 1.0)
-            let item = if dice < 0.7 { // Antientropic fabric (70% chance)
+            let mut item = if dice < 0.7 { // Antientropic fabric (70% chance)
                 let mut object = Object::new(x, y, '#', colors::FUCHSIA, "antientropic fabric", false);
                 object.item = Some(Item::Heal);
                 object
@@ -925,7 +1009,7 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
             } else if dice < 0.7 + 0.1 + 0.1 { // Negative energy grenade (10%)
                 let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
                                              "negative energy grenade", false);
-                object.item = Some(Item::Negative_energy_grenade);
+                object.item = Some(Item::NegativeEnergyGrenade);
                 object
             } else { // Disruptor (10%)
                 let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
@@ -933,18 +1017,25 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
                 object.item = Some(Item::Confuse);
                 object
             };
+            item.always_visible = true;
             objects.push(item);
         }
     }
 }
 
+/// Creates a new level
 fn make_map(objects: &mut Vec<Object>) -> Map {
-    // Fill map with wall tiles (underground)
+    // Fill level with wall tiles (underground)
     let mut map = vec![vec![Tile::new_wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
+
+    // Remove any old objects except the player
+    // (We compare raw pointers to make sure first object is the player object. This is crashes
+    // if it's not due to some refactor later.)
+    assert_eq!(&objects[PLAYER] as *const _, &objects[0] as *const _);
+    objects.truncate(1);
 
     // Hollow out {MAX_ROOMS} randomly-sized rooms
     let mut rooms: Vec<Rect> = vec![]; // Reference of rooms for tunnel rendering, etc.
-    //let mut starting_position = (0, 0); // Player start (to-be center of first room)
 
     for _ in 0..MAX_ROOMS {
         // Random width, height
@@ -984,8 +1075,24 @@ fn make_map(objects: &mut Vec<Object>) -> Map {
         }
     }
 
+    // Put stairs at the center of last room
+    let (last_room_x, last_room_y) = rooms[rooms.len() - 1].center();
+    let mut stairs = Object::new(last_room_x, last_room_y, '>', colors::WHITE, "stairs down", false);
+    stairs.always_visible = true;
+    objects.push(stairs);
+
     map
 }
+
+/// Builds a new level and advances the player to it
+fn next_level(tcod: &mut Tcod, objects: &mut Vec<Object>, game: &mut Game) {
+    game.log.add("You delve deeper...", colors::GREY);
+
+    game.dungeon_level += 1;
+    game.map = make_map(objects);
+    init_fov(tcod, &game.map);
+}
+
 
 fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recompute: bool) {
     if fov_recompute { // Player moved
@@ -1017,9 +1124,14 @@ fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recomput
         }
     }
 
+    // Draw all objects
     // Set object render hierarchy (e.g., live actors cover corpses and items), but only bother
-    // if they're visible (in FOV)
-    let mut to_draw: Vec<_> = objects.iter().filter(|o| tcod.fov.is_in_fov(o.x, o.y)).collect();
+    // if they're visible
+    let mut to_draw: Vec<_> = objects.iter()
+        .filter(|o| {
+            tcod.fov.is_in_fov(o.x, o.y) ||
+                (o.always_visible &&  game.map[o.x as usize][o.y as usize].explored)
+        }).collect();
     // Sort so that non-blocking objects come first
     // Note: Below, |a, b| tacitly means "a is less than b", so:
     //      a.cmp(b) = Ordering::Less
@@ -1028,7 +1140,6 @@ fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recomput
     // which sorts it in descending order.
     // Also, false < true in bool comparisons.
     to_draw.sort_unstable_by(|o1, o2| { o1.blocks.cmp(&o2.blocks) }); // false < true ascending
-    // Draw all objects
     for object in &to_draw {
         object.draw(&mut tcod.con);
     }
@@ -1059,6 +1170,9 @@ fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recomput
     let hp = objects[PLAYER].fighter.map_or(0, |f| f.hp);
     let max_hp = objects[PLAYER].fighter.map_or(0, |f| f.max_hp);
     render_bar(&mut tcod.panel, 1, 1, BAR_WIDTH, "HP", hp, max_hp, colors::LIGHT_RED, colors::DARKER_RED);
+    // Show location
+    tcod.panel.print_ex(1, 3, BackgroundFlag::None, TextAlignment::Left,
+                        format!("Dungeon level: {}", game.dungeon_level));
 
     // display names of objects under the mouse
     tcod.panel.set_default_foreground(colors::LIGHT_GREY);
@@ -1103,7 +1217,14 @@ fn handle_keys(key: Key,
         // Movement
         // Note: ~1 sec movement delay when changing spammed direction seems like
         // industry standard (same effect in Crawl, etc.).
-        // Arrow
+        /* Arrow
+
+     Home ⮝ PgUp
+         \|/
+        ⮜-.-⮞
+         /|\
+     End ⮟ PgDown
+        */
         (Key { code: Up, .. }, true) => {
             player_move_or_attack(0, -1, objects, game);
             PlayerAction::TookTurn
@@ -1118,6 +1239,25 @@ fn handle_keys(key: Key,
         }
         (Key { code: Right, .. }, true) => {
             player_move_or_attack(1, 0, objects, game);
+            PlayerAction::TookTurn
+        }
+        (Key { code: Home, .. }, true) => {
+            player_move_or_attack(-1, -1, objects, game);
+            PlayerAction::TookTurn
+        }
+        (Key { code: PageUp, .. }, true) => {
+            player_move_or_attack(1, -1, objects, game);
+            PlayerAction::TookTurn
+        }
+        (Key { code: End, .. }, true) => {
+            player_move_or_attack(-1, 1, objects, game);
+            PlayerAction::TookTurn
+        }
+        (Key { code: PageDown, .. }, true) => {
+            player_move_or_attack(1, 1, objects, game);
+            PlayerAction::TookTurn
+        }
+        (Key { printable: '.', shift: false, .. }, true) => {
             PlayerAction::TookTurn
         }
         /* Numpad
@@ -1144,9 +1284,9 @@ fn handle_keys(key: Key,
             player_move_or_attack(-1, 0, objects, game);
             PlayerAction::TookTurn
         }
-        /*(Key { code: NumPad5, .. }, true) => {
-
-        }*/
+        (Key { code: NumPad5, .. }, true) => {
+            PlayerAction::TookTurn
+        }
         (Key { code: NumPad6, .. }, true) => {
             player_move_or_attack(1, 0, objects, game);
             PlayerAction::TookTurn
@@ -1246,6 +1386,27 @@ fn handle_keys(key: Key,
             player_move_or_attack(1, 1, map, objects, messages);
             PlayerAction::TookTurn
         }*/
+        (Key { printable: '.', shift: true, .. }, true) => { // Go down stairs
+            let player_on_stairs = objects.iter().any(|object| {
+                object.name == "stairs down" && object.pos() == objects[PLAYER].pos()
+            });
+
+            if player_on_stairs {
+                next_level(tcod, objects, game);
+            }
+            PlayerAction::DidntTakeTurn
+        }/*
+        (Key, {printable: '<', .. }, true) => { // Go up stairs
+            let player_on_stairs = objects.iter().any(|object| {
+                object.name == "stairs up" && object.pos() == object[PLAYER].pos()
+            });
+
+            if player_on_stairs {
+                next_level(tcod, objects, game);
+            }
+            PlayerAction::DidntTakeTurn
+        }
+        */
         // Actions
         (Key { printable: 'g', .. }, true) => { // Pick up item
             let item_id = objects.iter().position(|object| {
@@ -1278,12 +1439,32 @@ fn handle_keys(key: Key,
             }
             PlayerAction::DidntTakeTurn
         }
+        (Key { printable: 'c', .. }, true) => { // Show stats
+            let player = &objects[PLAYER];
+            if let Some(fighter) = player.fighter {
+                let msg = format!("
+Character stats
 
+HP: {}/{}
+Power: {}
+Defense: {}
+Level: {}
+XP: {} ({} to next level)
+                ", // Note: format!() is delightfuly literal about its text formatting!
+                fighter.hp, fighter.max_hp,
+                fighter.power,
+                fighter.defense,
+                fighter.level,
+                fighter.xp, (LEVEL_XP_RANGE[fighter.level as usize] - fighter.xp));
+                msgbox(&mut tcod.root, &msg, STATS_SCREEN_WIDTH);
+            }
+            PlayerAction::DidntTakeTurn
+        }
         _ => PlayerAction::DidntTakeTurn,
     }
 }
 
-/// Builds FOV map determining player sight
+/// Populates a Tcod's FOV according to a Game's map, determining player sight
 fn init_fov(tcod: &mut Tcod, map: &Map) {
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
@@ -1304,6 +1485,8 @@ fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
                                    hp: 30,
                                    defense: 2,
                                    power: 5,
+                                   xp: 0,
+                                   level: 0,
                                    on_death: DeathCallback::Player });
 
     let mut objects = vec![player];
@@ -1312,6 +1495,7 @@ fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
         map: make_map(&mut objects),
         log: vec![],
         inv: vec![],
+        dungeon_level: 1,
     };
 
     init_fov(tcod, &game.map);
@@ -1368,6 +1552,8 @@ fn play_game(tcod: &mut Tcod, objects: &mut Vec<Object>, game: &mut Game) {
         let fov_recompute = prev_player_pos != (objects[PLAYER].pos());
         render_all(tcod, &objects, game, fov_recompute);
         tcod.root.flush(); // Presents root's content update to the screen
+
+        level_up(tcod, objects, game); // Check for player ding; TODO: move this to a reward_XP()
 
         // Erase all objects at their old locations before they move
         for object in objects.iter_mut() {
@@ -1444,7 +1630,7 @@ fn main_menu(tcod: &mut Tcod) {
 
 fn main() {
     // System initialization (tcod window and consoles)
-    let mut root = Root::initializer()
+    let root = Root::initializer()
         .font("terminal10x10_gs_tc.png", FontLayout::Tcod)
         .font_type(FontType::Greyscale)
         .size(SCREEN_WIDTH, SCREEN_HEIGHT)

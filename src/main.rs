@@ -16,7 +16,7 @@ use tcod::console::*;
 use tcod::colors::{self, Color}; // roguecentral.org/doryen/data/libtcod/doc/1.5.1/html2/color.html
 use tcod::input::{self, Event, Key, Mouse};
 use tcod::map::{Map as FovMap, FovAlgorithm}; // We use "Map" for our tile array; rename to FovMap
-use rand::Rng;
+use rand::prelude::*;
 
 // Tutorial: https://tomassedovic.github.io/roguelike-tutorial/index.html
 // tcod-rs library docs: https://tomassedovic.github.io/tcod-rs/tcod/index.html
@@ -41,8 +41,6 @@ const MAP_HEIGHT: i32 = 43;
 const ROOM_MAX_SIZE: i32 = 10;
 const ROOM_MIN_SIZE: i32 = 6;
 const MAX_ROOMS: i32 = 30;
-const MAX_ROOM_MONSTERS: i32 = 3;
-const MAX_ROOM_ITEMS: i32 = 2;
 
 const COLOR_DARK_WALL: Color = Color { r: 0, g: 6, b: 13 };
 const COLOR_LIGHT_WALL: Color = Color { r: 107, g: 0, b: 143 };
@@ -57,13 +55,13 @@ const TORCH_RADIUS: i32 = 10;
 // XP and levels
 const LEVEL_XP_RANGE: [i32; 10] = [60, 138, 290, 550, 940, 1498, 2247, 3145, 4403, 5724];
 
-const HEAL_AMOUNT: i32 = 4;
+const HEAL_AMOUNT: i32 = 40;
 const ENE_AGGR_RANGE: i32 = 5;
-const ENE_AGGR_DAMAGE: i32 = 20;
+const ENE_AGGR_DAMAGE: i32 = 40;
 const CONFUSE_RANGE: i32 = 8;
 const CONFUSE_NUM_TURNS: i32 = 10;
 const NEG_ENE_GREN_RADIUS: i32 = 3;
-const NEG_ENE_GREN_DAMAGE: i32 = 12;
+const NEG_ENE_GREN_DAMAGE: i32 = 25;
 
 // Player will always be the first object
 const PLAYER: usize = 0;
@@ -719,15 +717,15 @@ fn level_up(tcod: &mut Tcod, objects: &mut [Object], game: &mut Game) {
 
     if pf.xp >= LEVEL_XP_RANGE[pf.level as usize] {
         pf.level += 1; // Ding!
-        game.log.add(format!("You've reached level {}!", 0), colors::YELLOW);
+        game.log.add(format!("You've reached level {}!", pf.level), colors::YELLOW);
         // Increase stats
         let mut choice = None;
 
         while choice.is_none() { // Keep asking until a choice is made
             choice = menu("Choose a stat to raise:\n",
-                          &[format!("+20 HP (to {} HP)", pf.max_hp),
-                            format!("+1 power (to {})", pf.power),
-                            format!("+1 defense (to {})", pf.defense)],
+                          &[format!("+20 HP (to {} HP)", pf.max_hp + 20),
+                            format!("+1 power (to {})", pf.power + 1),
+                            format!("+1 defense (to {})", pf.defense + 1)],
                           LEVEL_SCREEN_WIDTH,
                           &mut tcod.root);
         };
@@ -946,42 +944,83 @@ fn create_v_tunnel(y1: i32, y2: i32, x: i32, map: &mut Map) {
     }
 }
 
+// Returns a value associated with a given level, typically representing weighted randomness
+// (max number of a certain item or mob for that level, etc.)
+// table - array of (level, value) tuples
+fn from_dungeon_level(table: &[(u32, u32)], curr_level: u32) -> u32 {
+    table.iter()
+        .rev() // Since we want the exact or immediately-lesser level association
+        .find(|transition| transition.0 <= curr_level)
+        .map_or(0, |transition| transition.1)
+}
+
 /// Populates a room with objects
-fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
-    // Spawn random number of monsters per room
-    let num_monsters = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
+fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map, dungeon_level: u32) {
+    // Spawn random number of monsters per room, increasing with higher dungeon levels
+    let max_monsters = from_dungeon_level(&[
+        (1, 2),
+        (4, 3),
+        (6, 5),
+    ], dungeon_level);
+    let num_monsters = rand::thread_rng().gen_range(0, max_monsters + 1);
 
     for _ in 0..num_monsters {
         let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
         let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
 
         if !is_blocked(x, y, objects, map) {
-            let mut monster = if rand::random::<f32>() < 0.75 { // 75% chance for soliton
-                let mut soliton = Object::new(x, y, 's', colors::DARKER_RED, "soliton", true);
-                soliton.fighter = Some(Fighter{
-                    max_hp: 10,
-                    hp: 10,
-                    defense: 0,
-                    power: 3,
-                    xp: 5,
-                    level: 0,
-                    on_death: DeathCallback::Monster,
-                });
-                soliton.ai = Some(Ai::Basic);
-                soliton
-            } else { // 25% chance for bion
-                let mut bion = Object::new(x, y, 'b', colors::DARKER_GREEN, "bion", true);
-                bion.fighter = Some(Fighter{
-                    max_hp: 16,
-                    hp: 16,
-                    defense: 1,
-                    power: 4,
-                    xp: 10,
-                    level: 0,
-                    on_death: DeathCallback::Monster,
-                });
-                bion.ai = Some(Ai::Basic);
-                bion
+            // Scale monster chances with level difficulty
+            let soliton_chance = from_dungeon_level(&[
+                (1, 75), // 75% chance for a soliton... until level 5
+                (5, 60),
+                (7, 50),
+            ], dungeon_level);
+            let bion_chance = from_dungeon_level(&[
+                (1, 25),
+                (5, 40),
+                (7, 50),
+            ], dungeon_level);
+
+            // Pick a monster randomly according to designated chances
+            let monster_table = [
+                ("soliton", soliton_chance),
+                ("bion", bion_chance),
+            ];
+            let mut rng = rand::thread_rng();
+            let dist = rand::distributions::WeightedIndex::new(monster_table
+                .iter()
+                .map(|mon| mon.1))
+                .unwrap();
+            let mut monster = match monster_table[dist.sample(&mut rng)].0 {
+                "soliton" => {
+                    let mut soliton = Object::new(x, y, 's', colors::DARKER_RED, "soliton", true);
+                    soliton.fighter = Some(Fighter{
+                        max_hp: 10,
+                        hp: 10,
+                        defense: 0,
+                        power: 3,
+                        xp: 5,
+                        level: 0,
+                        on_death: DeathCallback::Monster,
+                    });
+                    soliton.ai = Some(Ai::Basic);
+                    soliton
+                }
+                "bion" => {
+                    let mut bion = Object::new(x, y, 'b', colors::DARKER_GREEN, "bion", true);
+                    bion.fighter = Some(Fighter{
+                        max_hp: 20,
+                        hp: 16,
+                        defense: 2,
+                        power: 8,
+                        xp: 10,
+                        level: 0,
+                        on_death: DeathCallback::Monster,
+                    });
+                    bion.ai = Some(Ai::Basic);
+                    bion
+                }
+                _ => unreachable!(),
             };
             monster.alive = true; // It's alive!!!
             objects.push(monster);
@@ -989,33 +1028,60 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
     }
 
     // Spawn random number of items per room
-    let num_items = rand::thread_rng().gen_range(0, MAX_ROOM_ITEMS + 1);
+    let max_items = from_dungeon_level(&[
+        (1, 1),
+        (4, 2),
+    ], dungeon_level);
+    let num_items = rand::thread_rng().gen_range(0, max_items + 1);
+
+    // Random item table
+    let heal_chances = from_dungeon_level(&[
+        // Healing items become slightly more common... bions are tough.
+        (1, 70),
+        (5, 75),
+        (7, 80),
+    ], dungeon_level);
 
     for _ in 0..num_items {
         let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
         let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
 
         if !is_blocked(x, y, objects, map) {
-            let dice = rand::random::<f32>(); // [0.0, 1.0)
-            let mut item = if dice < 0.7 { // Antientropic fabric (70% chance)
-                let mut object = Object::new(x, y, '#', colors::FUCHSIA, "antientropic fabric", false);
-                object.item = Some(Item::Heal);
-                object
-            } else if dice < 0.7 + 0.1 { // Aggregator (10%)
-                let mut object = Object::new(x, y, '^', colors::LIGHT_YELLOW,
-                                             "aggregator", false);
-                object.item = Some(Item::Aggregate);
-                object
-            } else if dice < 0.7 + 0.1 + 0.1 { // Negative energy grenade (10%)
-                let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
-                                             "negative energy grenade", false);
-                object.item = Some(Item::NegativeEnergyGrenade);
-                object
-            } else { // Disruptor (10%)
-                let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
-                                             "disruptor", false);
-                object.item = Some(Item::Confuse);
-                object
+            let item_table = &mut [
+                (Item::Heal, heal_chances),
+                (Item::Aggregate, 10),
+                (Item::NegativeEnergyGrenade, 10),
+                (Item::Confuse, 10),
+            ];
+            let mut rng = rand::thread_rng();
+            let dist = rand::distributions::WeightedIndex::new(item_table
+                .iter()
+                .map(|it| it.1))
+                .unwrap();
+            let mut item = match item_table[dist.sample(&mut rng)].0 {
+                Item::Heal => {
+                    let mut object = Object::new(x, y, '#', colors::FUCHSIA, "antientropic fabric", false);
+                    object.item = Some(Item::Heal);
+                    object
+                }
+                Item::Aggregate => {
+                    let mut object = Object::new(x, y, '^', colors::LIGHT_YELLOW,
+                                                 "aggregator", false);
+                    object.item = Some(Item::Aggregate);
+                    object
+                }
+                Item::NegativeEnergyGrenade => {
+                    let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
+                                                 "negative energy grenade", false);
+                    object.item = Some(Item::NegativeEnergyGrenade);
+                    object
+                }
+                Item::Confuse => {
+                    let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
+                                                 "disruptor", false);
+                    object.item = Some(Item::Confuse);
+                    object
+                }
             };
             item.always_visible = true;
             objects.push(item);
@@ -1024,7 +1090,7 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map) {
 }
 
 /// Creates a new level
-fn make_map(objects: &mut Vec<Object>) -> Map {
+fn make_map(objects: &mut Vec<Object>, dungeon_level: u32) -> Map {
     // Fill level with wall tiles (underground)
     let mut map = vec![vec![Tile::new_wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
 
@@ -1069,7 +1135,7 @@ fn make_map(objects: &mut Vec<Object>) -> Map {
                 }
             }
             // Populate every room
-            place_objects(new_room, objects, &map);
+            place_objects(new_room, objects, &map, dungeon_level);
 
             rooms.push(new_room);
         }
@@ -1089,7 +1155,7 @@ fn next_level(tcod: &mut Tcod, objects: &mut Vec<Object>, game: &mut Game) {
     game.log.add("You delve deeper...", colors::GREY);
 
     game.dungeon_level += 1;
-    game.map = make_map(objects);
+    game.map = make_map(objects, game.dungeon_level);
     init_fov(tcod, &game.map);
 }
 
@@ -1481,18 +1547,19 @@ fn init_fov(tcod: &mut Tcod, map: &Map) {
 fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
     let mut player = Object::new(0, 0, '@', colors::WHITE, "player", true);
     player.alive = true;
-    player.fighter = Some(Fighter{ max_hp: 30,
-                                   hp: 30,
-                                   defense: 2,
-                                   power: 5,
+    player.fighter = Some(Fighter{ max_hp: 100,
+                                   hp: 100,
+                                   defense: 1,
+                                   power: 4,
                                    xp: 0,
                                    level: 0,
                                    on_death: DeathCallback::Player });
 
     let mut objects = vec![player];
+    let first_level = 1;
 
     let mut game = Game {
-        map: make_map(&mut objects),
+        map: make_map(&mut objects, first_level),
         log: vec![],
         inv: vec![],
         dungeon_level: 1,
@@ -1501,7 +1568,7 @@ fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
     init_fov(tcod, &game.map);
 
     // A warm, welcoming message!
-    game.log.add("You emerge, lost, in the ergosphere!", colors::RED);
+    game.log.add("You enter the ergosphere...", colors::RED);
 
     (objects, game)
 }

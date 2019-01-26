@@ -151,6 +151,7 @@ struct Object {
     fighter: Option<Fighter>,
     ai: Option<Ai>,
     item: Option<Item>,
+    equipment: Option<Equipment>,
 }
 impl Object {
     pub fn new(x: i32, y: i32, char: char, color: Color, name: &str, blocks: bool) -> Self {
@@ -167,6 +168,7 @@ impl Object {
             fighter: None,
             ai: None,
             item: None,
+            equipment: None,
         }
     }
 
@@ -200,6 +202,31 @@ impl Object {
         ((dx.pow(2) + dy.pow(2)) as f32).sqrt() // Euclidean
     }
 
+    // Return distance to some coords
+    pub fn distance(&self, x: i32, y: i32) -> f32 {
+        (((self.x - x).pow(2) + (self.y - y).pow(2)) as f32).sqrt() // Euclidean
+    }
+
+    pub fn get_max_hp(&self, game: &Game) -> i32 {
+        let base = self.fighter.map_or(0, |f| f.base_max_hp);
+        let buff = self.get_all_equipped(game).iter().fold(0, |acc, e| acc + e.hp_buff);
+        // TODO: Add support for consumables!
+        base + buff
+    }
+
+    pub fn get_power(&self, game: &Game) -> i32 {
+        let base = self.fighter.map_or(0, |f| f.base_power);
+        // Add the power buffs of all equipped items
+        let buff = self.get_all_equipped(game).iter().fold(0, |acc, e| acc + e.power_buff);
+        base + buff
+    }
+
+    pub fn get_defense(&self, game: &Game) -> i32 {
+        let base = self.fighter.map_or(0, |f| f.base_defense);
+        let buff = self.get_all_equipped(game).iter().fold(0, |acc, e| acc + e.defense_buff);
+        base + buff
+    }
+
     /// Applies damage if this object has Fighter and returns kill XP in an option
     /// on this object's death
     pub fn take_damage(&mut self, damage: i32, game: &mut Game) -> Option<i32> {
@@ -222,7 +249,7 @@ impl Object {
 
     pub fn attack(&mut self, target: &mut Object, game: &mut Game) {
         // Simple formula for attack damage
-        let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
+        let damage = self.get_power(game) - target.get_defense(game);
         if damage > 0 {
             game.log.add(format!("{} attacks {} for {} HP.", self.name, target.name, damage),
                          colors::WHITE);
@@ -242,18 +269,58 @@ impl Object {
     // when it gets kills with items, abilities, etc.
 
     // Heal up to max_hp by given amount
-    pub fn heal(&mut self, amount: i32) {
-        if let Some(ref mut fighter) = self.fighter {
+    pub fn heal(&mut self, amount: i32, game: &Game) {
+        let max_hp = self.get_max_hp(game);
+
+        if let Some(fighter) = self.fighter.as_mut() {
             fighter.hp += amount;
-            if fighter.hp > fighter.max_hp {
-                fighter.hp = fighter.max_hp;
+            if fighter.hp > max_hp {
+                fighter.hp = max_hp;
             }
         }
     }
 
-    // Return distance to some coords
-    pub fn distance(&self, x: i32, y: i32) -> f32 {
-        (((self.x - x).pow(2) + (self.y - y).pow(2)) as f32).sqrt() // Euclidean
+    pub fn equip(&mut self, log: &mut Vec<(String, Color)>) {
+        if self.item.is_none() {
+            log.add("You can only equip items.", colors::RED);
+        } else {
+            if let Some(eq) = self.equipment.as_mut() {
+                if ! eq.equipped {
+                    eq.equipped = true;
+                    log.add(format!("You equip {}.", self.name), colors::LIGHT_GREEN);
+                } // If item was already equipped, do nothing...
+            } else {
+                log.add("That item can't be equipped.", colors::RED);
+            }
+        }
+    }
+
+    pub fn unequip(&mut self, log: &mut Vec<(String, Color)>) {
+        if self.item.is_none() {
+            log.add("You can only unequip items.", colors::RED);
+        } else {
+            if let Some(eq) = self.equipment.as_mut() {
+                if eq.equipped {
+                    eq.equipped = false;
+                    log.add(format!("You unequip {}.", self.name), colors::LIGHT_YELLOW);
+                } // If item wasn't equipped, do nothing...
+            } else {
+                log.add("That item can't be unequipped.", colors::RED);
+            }
+        }
+    }
+
+    pub fn get_all_equipped(&self, game: &Game) -> Vec<Equipment> {
+        if self.name == "player" { // Right now, the player is the only object that can equip.
+            game.inv.iter()
+                .filter(|item| {
+                    item.equipment.map_or(false, |e| e.equipped)
+                })
+                .map(|item| item.equipment.unwrap())
+                .collect()
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -281,10 +348,10 @@ struct Game {
 // Able to attack or be attacked, die meaningfully, and earn XP
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Fighter {
-    max_hp: i32,
+    base_max_hp: i32,
     hp: i32,
-    defense: i32,
-    power: i32,
+    base_defense: i32,
+    base_power: i32,
 
     xp: i32,
     level: i32,
@@ -309,10 +376,40 @@ enum PlayerAction {
 // Item "categories" associated with an effect function in use_item()
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 enum Item {
+    // Consumables
     Heal,
     Aggregate,
     Confuse,
     NegativeEnergyGrenade,
+    // Equipment
+    Sword,
+    Shield,
+}
+
+// Able to be equipped
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Equipment {
+    slot: Slot,
+    equipped: bool,
+    hp_buff: i32,
+    power_buff: i32,
+    defense_buff: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum Slot {
+    LeftHand,
+    RightHand,
+    Head,
+}
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Slot::LeftHand => write!(f, "in left hand"),
+            Slot::RightHand => write!(f, "in right hand"),
+            Slot::Head => write!(f, "on head"),
+        }
+    }
 }
 
 // On death, monsters drop loot and leave corpses, the player loses the game, etc.
@@ -335,6 +432,7 @@ impl DeathCallback {
 // Item after-use states, determining item consumption
 enum UseResult {
     UsedUp,
+    UsedAndKept,
     Cancelled,
 }
 
@@ -523,7 +621,15 @@ fn inventory_menu(inventory: &[Object], header: &str, root: &mut Root) -> Option
     let options = if inventory.len() == 0 {
         vec!["Inventory is empty.".into()]
     } else {
-        inventory.iter().map(|item| { item.name.clone() }).collect()
+        inventory.iter().map(|item| {
+            // Show additional info for equipped items
+            match item.equipment {
+                Some(eq) if eq.equipped => {
+                    format!("{} ({})", item.name, eq.slot)
+                }
+                _ => item.name.clone()
+            }
+        }).collect()
     };
 
     let inventory_index = menu(header, &options, INVENTORY_WIDTH, root);
@@ -614,7 +720,7 @@ fn closest_monster(max_range: i32, objects: &mut [Object], tcod: &Tcod) -> Optio
 }
 
 /// Mutably borrow two separate elements from the given slice (without this, compiler would
-/// complain that we're mutably borrowing the items container twice)
+/// complain that we're mutably borrowing the items' container twice)
 /// Panics when the indexes are equal or out of bounds
 fn mut_two<T>(first_index: usize, second_index: usize, items: &mut [T]) -> (&mut T, &mut T) {
     assert!(first_index != second_index);
@@ -710,7 +816,7 @@ fn monster_death(monster: &mut Object, game: &mut Game) {
 
 // Level up the player
 fn level_up(tcod: &mut Tcod, objects: &mut [Object], game: &mut Game) {
-    let pf = objects[PLAYER].fighter.as_mut().unwrap();
+    let pf = objects[PLAYER].fighter.as_mut().unwrap(); // Crash if player lacks Fighter
     // Rust noob note: Must use as_mut(), otherwise, a new Fighter is copied into this scope.
     // We do that frequently throughout this code when we're only reading from Fighters.
     // With foo: Option<T>, foo.as_mut() = Option<&mut T>, which .unwrap()s to a &mut T.
@@ -723,22 +829,22 @@ fn level_up(tcod: &mut Tcod, objects: &mut [Object], game: &mut Game) {
 
         while choice.is_none() { // Keep asking until a choice is made
             choice = menu("Choose a stat to raise:\n",
-                          &[format!("+20 HP (to {} HP)", pf.max_hp + 20),
-                            format!("+1 power (to {})", pf.power + 1),
-                            format!("+1 defense (to {})", pf.defense + 1)],
+                          &[format!("+20 HP (to {} HP)", pf.base_max_hp + 20),
+                            format!("+1 power (to {})", pf.base_power + 1),
+                            format!("+1 defense (to {})", pf.base_defense + 1)],
                           LEVEL_SCREEN_WIDTH,
                           &mut tcod.root);
         };
         match choice.unwrap() {
             0 => {
-                pf.max_hp += 20;
+                pf.base_max_hp += 20;
                 pf.hp += 20;
             }
             1 => {
-                pf.power += 1;
+                pf.base_power += 1;
             }
             2 => {
-                pf.defense += 1;
+                pf.base_defense += 1;
             }
             _ => unreachable!(),
         }
@@ -761,6 +867,9 @@ fn drop_item(inventory_id: usize,
              objects: &mut Vec<Object>,
              game: &mut Game) {
     let mut item = game.inv.remove(inventory_id);
+    if item.equipment.is_some() { // If equippable, try to unequip in case it was equipped.
+        item.unequip(&mut game.log);
+    }
     item.set_pos(objects[PLAYER].x, objects[PLAYER].y);
     game.log.add(format!("Dropped {}.", item.name),
                  colors::YELLOW);
@@ -788,6 +897,9 @@ fn use_item(tcod: &mut Tcod,
             Item::Aggregate => cast_ene_aggr,
             Item::Confuse => cast_confuse,
             Item::NegativeEnergyGrenade => cast_neg_ene_gren,
+
+            Item::Sword => toggle_equipment,
+            Item::Shield => toggle_equipment,
         };
 
         // If we have an item, match its effect type
@@ -795,6 +907,7 @@ fn use_item(tcod: &mut Tcod,
             UseResult::UsedUp => { // Destroy after use (unless it was cancelled)
                 game.inv.remove(inventory_id);
             }
+            UseResult::UsedAndKept => {}
             UseResult::Cancelled => {
                 game.log.add("Cancelled", colors::WHITE);
             }
@@ -812,15 +925,17 @@ fn cast_heal(_tcod: &mut Tcod,
              _inventory_id: usize,
              objects: &mut [Object],
              game: &mut Game) -> UseResult {
-    if let Some(fighter) = objects[PLAYER].fighter {
-        if fighter.hp == fighter.max_hp {
+    let player = &mut objects[PLAYER];
+
+    if let Some(fighter) = player.fighter {
+        if fighter.hp == player.get_max_hp(game) {
             game.log.add("You're already at full HP!", colors::RED);
             return UseResult::Cancelled;
         }
         game.log.add("Your wounds begin knitting themselves shut.", colors::LIGHT_VIOLET);
         // Call player object heal function with HEAL_AMOUNT associated with the item type of
         // objects[inventory_id]
-        objects[PLAYER].heal(HEAL_AMOUNT);
+        player.heal(HEAL_AMOUNT, game);
         return UseResult::UsedUp;
     }
     UseResult::Cancelled
@@ -905,6 +1020,36 @@ fn cast_neg_ene_gren(tcod: &mut Tcod,
     }
     objects[PLAYER].fighter.as_mut().unwrap().xp += xp_accumulated;
     UseResult::UsedUp
+}
+
+fn get_equipped_in_slot(slot: Slot, inv: &[Object]) -> Option<usize> {
+    for (inv_id, item) in inv.iter().enumerate() {
+        if item.equipment.as_ref().map_or(false, |e| e.equipped && e.slot == slot) {
+            return Some(inv_id)
+        }
+    }
+    None
+}
+
+fn toggle_equipment(_tcod: &mut Tcod,
+                    inventory_id: usize,
+                    _objects: &mut [Object],
+                    game: &mut Game) -> UseResult {
+    let eq = match game.inv[inventory_id].equipment {
+        Some(eq) => eq,
+        None => return UseResult::Cancelled,
+    };
+    if eq.equipped {
+        game.inv[inventory_id].unequip(&mut game.log);
+    } else {
+        // Unequip whatever, if anything, is already in the slot
+        if let Some(prev_eq) = get_equipped_in_slot(eq.slot, &game.inv) {
+            game.inv[prev_eq].unequip(&mut game.log);
+        }
+        // Then equip the item this was called on
+        game.inv[inventory_id].equip(&mut game.log);
+    }
+    UseResult::UsedAndKept
 }
 
 /******************************************************************************
@@ -995,10 +1140,10 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map, dungeon_level
                 "soliton" => {
                     let mut soliton = Object::new(x, y, 's', colors::DARKER_RED, "soliton", true);
                     soliton.fighter = Some(Fighter{
-                        max_hp: 10,
+                        base_max_hp: 10,
                         hp: 10,
-                        defense: 0,
-                        power: 3,
+                        base_defense: 0,
+                        base_power: 3,
                         xp: 5,
                         level: 0,
                         on_death: DeathCallback::Monster,
@@ -1009,10 +1154,10 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map, dungeon_level
                 "bion" => {
                     let mut bion = Object::new(x, y, 'b', colors::DARKER_GREEN, "bion", true);
                     bion.fighter = Some(Fighter{
-                        max_hp: 20,
+                        base_max_hp: 20,
                         hp: 16,
-                        defense: 2,
-                        power: 8,
+                        base_defense: 2,
+                        base_power: 8,
                         xp: 10,
                         level: 0,
                         on_death: DeathCallback::Monster,
@@ -1052,6 +1197,8 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map, dungeon_level
                 (Item::Aggregate, 10),
                 (Item::NegativeEnergyGrenade, 10),
                 (Item::Confuse, 10),
+                (Item::Sword, 20),
+                (Item::Shield, 20),
             ];
             let mut rng = rand::thread_rng();
             let dist = rand::distributions::WeightedIndex::new(item_table
@@ -1080,6 +1227,26 @@ fn place_objects(room: Rect, objects: &mut Vec<Object>, map: &Map, dungeon_level
                     let mut object = Object::new(x, y, '"', colors::LIGHT_YELLOW,
                                                  "disruptor", false);
                     object.item = Some(Item::Confuse);
+                    object
+                }
+                Item::Sword => {
+                    let mut object = Object::new(x, y, '/', colors::SKY, "sword", false);
+                    object.item = Some(Item::Sword);
+                    object.equipment = Some(Equipment{ equipped: false,
+                                                       slot: Slot::RightHand,
+                                                       hp_buff: 0,
+                                                       power_buff: 3,
+                                                       defense_buff: 0, });
+                    object
+                }
+                Item::Shield => {
+                    let mut object = Object::new(x, y, '[', colors::GREY, "shield", false);
+                    object.item = Some(Item::Shield);
+                    object.equipment = Some(Equipment{ equipped: false,
+                                                       slot: Slot::LeftHand,
+                                                       hp_buff: 0,
+                                                       power_buff: 2,
+                                                       defense_buff: 0, });
                     object
                 }
             };
@@ -1234,7 +1401,7 @@ fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recomput
 
     // Show player stats & bars
     let hp = objects[PLAYER].fighter.map_or(0, |f| f.hp);
-    let max_hp = objects[PLAYER].fighter.map_or(0, |f| f.max_hp);
+    let max_hp = objects[PLAYER].get_max_hp(game);
     render_bar(&mut tcod.panel, 1, 1, BAR_WIDTH, "HP", hp, max_hp, colors::LIGHT_RED, colors::DARKER_RED);
     // Show location
     tcod.panel.print_ex(1, 3, BackgroundFlag::None, TextAlignment::Left,
@@ -1251,7 +1418,7 @@ fn render_all(tcod: &mut Tcod, objects: &[Object], game: &mut Game, fov_recomput
 
     if let Some(fighter) = objects[PLAYER].fighter {
         tcod.root.print_ex(1, SCREEN_HEIGHT - 2, BackgroundFlag::None, TextAlignment::Left,
-                        format!("HP: {}/{} ", fighter.hp, fighter.max_hp));
+                        format!("HP: {}/{} ", fighter.hp, objects[PLAYER].get_max_hp(game)));
     }
 }
 
@@ -1517,9 +1684,9 @@ Defense: {}
 Level: {}
 XP: {} ({} to next level)
                 ", // Note: format!() is delightfuly literal about its text formatting!
-                fighter.hp, fighter.max_hp,
-                fighter.power,
-                fighter.defense,
+                fighter.hp, objects[PLAYER].get_max_hp(game),
+                player.get_power(game),
+                player.get_defense(game),
                 fighter.level,
                 fighter.xp, (LEVEL_XP_RANGE[fighter.level as usize] - fighter.xp));
                 msgbox(&mut tcod.root, &msg, STATS_SCREEN_WIDTH);
@@ -1547,10 +1714,10 @@ fn init_fov(tcod: &mut Tcod, map: &Map) {
 fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
     let mut player = Object::new(0, 0, '@', colors::WHITE, "player", true);
     player.alive = true;
-    player.fighter = Some(Fighter{ max_hp: 100,
+    player.fighter = Some(Fighter{ base_max_hp: 100,
                                    hp: 100,
-                                   defense: 1,
-                                   power: 4,
+                                   base_defense: 1,
+                                   base_power: 2,
                                    xp: 0,
                                    level: 0,
                                    on_death: DeathCallback::Player });
@@ -1567,8 +1734,19 @@ fn new_game(tcod: &mut Tcod) -> (Vec<Object>, Game) {
 
     init_fov(tcod, &game.map);
 
-    // A warm, welcoming message!
+    // Give a warm, welcoming message
     game.log.add("You enter the ergosphere...", colors::RED);
+    // and a helpful piece of gear!
+    let mut dagger = Object::new(0, 0, '-', colors::SKY, "dagger", false);
+    dagger.item = Some(Item::Sword); // TODO: Make this its own Item::Dagger
+    dagger.equipment = Some(Equipment {
+        equipped: true,
+        slot: Slot::RightHand,
+        hp_buff: 0,
+        power_buff: 1,
+        defense_buff: 0,
+    });
+    game.inv.push(dagger);
 
     (objects, game)
 }

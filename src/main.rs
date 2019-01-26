@@ -23,6 +23,11 @@ use rand::prelude::*;
 // libtcod: https://github.com/libtcod/libtcod
 //          http://roguecentral.org/doryen/data/libtcod/doc/1.5.1/index2.html
 
+// TODO:
+// Fix fullscreen bounds issue. This broke somewhere along the way, so it DID work once.
+// Do extras:
+// http://www.roguebasin.com/index.php?title=Complete_Roguelike_Tutorial,_using_python%2Blibtcod#Extras
+
 /******************************************************************************
 Consts and types
 *******************************************************************************/
